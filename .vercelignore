@@ -1,0 +1,5 @@
+# Ignore backend Python code
+api/
+*.py
+*.csv
+requirements.txt
