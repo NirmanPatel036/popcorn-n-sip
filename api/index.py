@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
@@ -9,6 +9,8 @@ import io
 import pickle
 import os
 from typing import List, Optional
+import asyncio
+from datetime import datetime
 
 app = FastAPI(title="Movie Content Recommender API")
 
@@ -25,6 +27,16 @@ app.add_middleware(
 model = None
 df = None
 content_mappings = {}
+
+# Processing status tracking
+processing_status = {
+    "status": "idle",  # idle, processing, complete, error
+    "message": "Ready to process data",
+    "progress": 0,
+    "total_items": 0,
+    "started_at": None,
+    "completed_at": None
+}
 
 class RecommendationRequest(BaseModel):
     content_title: str
@@ -56,6 +68,11 @@ def preprocess_data(dataframe):
 
 def build_and_train_model(dataframe):
     """Build and train the recommendation model"""
+    global processing_status
+    
+    processing_status["message"] = "Building model architecture..."
+    processing_status["progress"] = 20
+    
     num_contents = dataframe['Content_ID'].nunique()
     num_languages = dataframe['Language_ID'].nunique()
     num_types = dataframe['ContentType_ID'].nunique()
@@ -65,27 +82,30 @@ def build_and_train_model(dataframe):
     language_input = layers.Input(shape=(1,), dtype=tf.int32, name='language_id')
     type_input = layers.Input(shape=(1,), dtype=tf.int32, name='content_type')
     
-    # Embedding layers
-    content_embedding = layers.Embedding(input_dim=num_contents+1, output_dim=32)(content_input)
-    language_embedding = layers.Embedding(input_dim=num_languages+1, output_dim=8)(language_input)
-    type_embedding = layers.Embedding(input_dim=num_types+1, output_dim=4)(type_input)
+    # Embedding layers (reduced dimensions for faster training)
+    content_embedding = layers.Embedding(input_dim=num_contents+1, output_dim=16)(content_input)  # Reduced from 32
+    language_embedding = layers.Embedding(input_dim=num_languages+1, output_dim=4)(language_input)  # Reduced from 8
+    type_embedding = layers.Embedding(input_dim=num_types+1, output_dim=2)(type_input)  # Reduced from 4
     
     # Flatten embeddings
     content_vec = layers.Flatten()(content_embedding)
     language_vec = layers.Flatten()(language_embedding)
     type_vec = layers.Flatten()(type_embedding)
     
-    # Combine and process
+    # Combine and process (smaller network)
     combined = layers.Concatenate()([content_vec, language_vec, type_vec])
-    x = layers.Dense(64, activation='relu')(combined)
-    x = layers.Dense(32, activation='relu')(x)
+    x = layers.Dense(32, activation='relu')(combined)  # Reduced from 64
+    x = layers.Dense(16, activation='relu')(x)  # Reduced from 32
     output = layers.Dense(num_contents, activation='softmax')(x)
     
     # Create and compile model
     model = Model(inputs=[content_input, language_input, type_input], outputs=output)
     model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
     
-    # Train model
+    processing_status["message"] = "Training model..."
+    processing_status["progress"] = 50
+    
+    # Train model with reduced complexity
     model.fit(
         x={
             'content_id': dataframe['Content_ID'],
@@ -93,12 +113,50 @@ def build_and_train_model(dataframe):
             'content_type': dataframe['ContentType_ID']
         },
         y=dataframe['Content_ID'],
-        epochs=5,
-        batch_size=64,
+        epochs=3,  # Reduced from 5
+        batch_size=32,  # Reduced from 64
         verbose=0
     )
     
+    processing_status["progress"] = 90
+    
     return model
+
+async def process_dataset_background(file_contents: bytes):
+    """Background task to process the dataset"""
+    global model, df, processing_status
+    
+    try:
+        processing_status["status"] = "processing"
+        processing_status["started_at"] = datetime.now().isoformat()
+        processing_status["message"] = "Reading CSV file..."
+        processing_status["progress"] = 10
+        
+        # Read and preprocess data
+        df = pd.read_csv(io.StringIO(file_contents.decode('utf-8')))
+        processing_status["total_items"] = len(df)
+        processing_status["message"] = "Preprocessing data..."
+        processing_status["progress"] = 15
+        
+        df = preprocess_data(df)
+        
+        # Build and train model
+        model = build_and_train_model(df)
+        
+        # Complete
+        processing_status["status"] = "complete"
+        processing_status["message"] = f"Successfully processed {len(df)} items"
+        processing_status["progress"] = 100
+        processing_status["completed_at"] = datetime.now().isoformat()
+        
+        print(f"Background processing complete: {len(df)} items processed")
+        
+    except Exception as e:
+        processing_status["status"] = "error"
+        processing_status["message"] = f"Error: {str(e)}"
+        processing_status["progress"] = 0
+        processing_status["completed_at"] = datetime.now().isoformat()
+        print(f"Background processing error: {str(e)}")
 
 @app.on_event("startup")
 async def startup_event():
@@ -141,20 +199,46 @@ async def startup_event():
     print("Model initialized with sample data")
 
 @app.post("/upload-data")
-async def upload_data(file: UploadFile = File(...)):
-    """Upload and process Netflix CSV data"""
-    global model, df, content_mappings
+async def upload_data(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """Upload and process Netflix CSV data in background"""
+    global processing_status
+    
+    # Check if already processing
+    if processing_status["status"] == "processing":
+        raise HTTPException(status_code=409, detail="Another upload is already being processed")
     
     try:
+        # Read file contents
         contents = await file.read()
-        df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
-        df = preprocess_data(df)
-        model = build_and_train_model(df)
         
-        return {"message": "Data uploaded and model trained successfully", "total_content": len(df)}
+        # Reset status
+        processing_status = {
+            "status": "processing",
+            "message": "Upload received, starting processing...",
+            "progress": 5,
+            "total_items": 0,
+            "started_at": datetime.now().isoformat(),
+            "completed_at": None
+        }
+        
+        # Start background processing
+        background_tasks.add_task(process_dataset_background, contents)
+        
+        return {
+            "message": "File uploaded successfully. Processing started in background.",
+            "status": "processing",
+            "check_status_at": "/processing-status"
+        }
+        
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error processing file: {str(e)}")
+        processing_status["status"] = "error"
+        processing_status["message"] = f"Upload error: {str(e)}"
+        raise HTTPException(status_code=400, detail=f"Error reading file: {str(e)}")
 
+@app.get("/processing-status")
+async def get_processing_status():
+    """Get current processing status"""
+    return processing_status
 
 @app.get("/content")
 async def get_all_content():
@@ -169,6 +253,9 @@ async def get_recommendations(request: RecommendationRequest):
     """Get content recommendations based on input title"""
     if model is None or df is None:
         raise HTTPException(status_code=400, detail="Model not initialized")
+    
+    if processing_status["status"] == "processing":
+        raise HTTPException(status_code=503, detail="Model is currently being retrained. Please try again later.")
     
     try:
         # Find content by title (case-insensitive partial match)
